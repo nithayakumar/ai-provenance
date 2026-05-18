@@ -131,6 +131,11 @@ def _query_one_history(
 
     row = rows[0]
     download_url = row["url"]
+
+    # data: URIs are base64-embedded images with no real provenance value
+    if download_url and download_url.startswith("data:"):
+        download_url = None
+
     referrer = row["referrer"] or ""
     tab_url = row["tab_url"] or ""
 

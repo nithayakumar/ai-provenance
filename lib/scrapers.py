@@ -150,7 +150,8 @@ def detect_platform(url: str) -> str:
     domain = urllib.parse.urlparse(url).netloc.lower()
     for key, name in [
         ("civitai", "civitai"), ("huggingface", "huggingface"),
-        ("artstation", "artstation"), ("deviantart", "deviantart"),
+        ("artstation", "artstation"),
+        ("deviantart", "deviantart"), ("wixmp", "deviantart"),  # wixmp.com = DeviantArt CDN
         ("flickr", "flickr"), ("pixiv", "pixiv"),
         ("shutterstock", "shutterstock"), ("gettyimages", "getty_images"),
         ("istockphoto", "istock"), ("unsplash", "unsplash"),
@@ -158,6 +159,7 @@ def detect_platform(url: str) -> str:
         ("googleuser", "google"), ("ggpht", "google"), ("gstatic", "google"),
         ("pinterest", "pinterest"), ("instagram", "instagram"),
         ("twitter", "twitter_x"), ("x.com", "twitter_x"),
+        ("wikimedia", "wikimedia"), ("wikipedia", "wikimedia"),
     ]:
         if key in domain:
             return name

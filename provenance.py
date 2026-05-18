@@ -126,7 +126,7 @@ def resolve_canonical(signals: dict, image_path: str = "") -> dict:
 
     # --- source ---
     source: dict = {}
-    if source_url:
+    if source_url and not source_url.startswith("data:"):
         source["url"]      = source_url
         source["domain"]   = urllib.parse.urlparse(source_url).netloc
         source["platform"] = scrapers.detect_platform(source_url)
@@ -239,9 +239,11 @@ def collect_provenance(
     use_browser_history: bool = True,
     dry_run: bool = False,
 ) -> dict:
-    """Full pipeline: gather → resolve → score → persist."""
+    """Full pipeline: gather → resolve → enrich → score → persist."""
+    from lib.enrichers import enrich as api_enrich
     signals  = gather_signals(image_path, source_url, source_page, http_meta, use_browser_history)
     prov     = resolve_canonical(signals, image_path)
+    prov     = api_enrich(prov)          # Wikimedia, Unsplash, Pexels (if API keys set)
     prov["completeness"] = compute_completeness(prov)
 
     score    = prov["completeness"]["score"]
