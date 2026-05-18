@@ -6,11 +6,12 @@ Commands:
   download <url>     Download an image and capture full provenance.
   scan <path>        Process already-downloaded images (file or folder).
   watch <dir>        Daemon — capture provenance for new images in a folder.
-  enrich <path>      Back-fill missing data from Chrome/Edge history + page scrape.
+  enrich <path>      Back-fill missing data from browser history, APIs, Wayback.
   history            Show recent image downloads from Chrome/Edge history.
   audit [path]       Gap report — files missing key provenance fields.
   migrate <path>     Upgrade v1.0 .provenance.json sidecars to v2.0.
   export [csv_path]  Export full collection to CSV.
+  report [out.html]  Generate a self-contained HTML provenance report.
 
 Examples:
   python provenance.py download https://civitai.com/images/123456
@@ -398,6 +399,13 @@ def cmd_enrich(args):
                 if lurl:
                     prov.setdefault("rights", {})["license_url"] = lurl
 
+        # Platform API enrichment (Unsplash, Pexels) + optional Wayback + Spawning
+        use_wayback  = getattr(args, "wayback",  False)
+        use_spawning = getattr(args, "spawning", False)
+        if use_wayback or use_spawning or _platform_apis_configured():
+            from lib.enrichers import enrich as api_enrich
+            prov = api_enrich(prov, wayback=use_wayback, spawning=use_spawning)
+
         prov["completeness"] = compute_completeness(prov)
         if not dry_run:
             sidecar.write_text(json.dumps(prov, indent=2, ensure_ascii=False, default=str),
@@ -513,6 +521,19 @@ def cmd_export(args):
     print(f"Exported {count} records -> {csv_path}")
 
 
+def cmd_report(args):
+    from lib.report import generate
+    out = getattr(args, "output", None) or "provenance_report.html"
+    limit = getattr(args, "limit", 5000)
+    count = generate(out, limit=limit)
+    print(f"Report: {count} assets -> {out}")
+
+
+def _platform_apis_configured() -> bool:
+    import os
+    return bool(os.environ.get("UNSPLASH_ACCESS_KEY") or os.environ.get("PEXELS_API_KEY"))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -551,10 +572,12 @@ def main():
     add_csv(p)
 
     # enrich
-    p = sub.add_parser("enrich", help="Back-fill from Chrome/Edge history.")
+    p = sub.add_parser("enrich", help="Back-fill from Chrome/Edge history + platform APIs.")
     p.add_argument("path")
     p.add_argument("--force", action="store_true")
     p.add_argument("--no-scrape", dest="no_scrape", action="store_true")
+    p.add_argument("--wayback",  action="store_true", help="Archive source URLs to Wayback Machine.")
+    p.add_argument("--spawning", action="store_true", help="Check Spawning DNTR opt-out registry.")
     add_dry(p)
 
     # history
@@ -575,6 +598,12 @@ def main():
     p = sub.add_parser("export", help="Export full collection to CSV.")
     p.add_argument("csv_path", nargs="?", default=DEFAULT_CSV)
 
+    # report
+    p = sub.add_parser("report", help="Generate a self-contained HTML provenance report.")
+    p.add_argument("output", nargs="?", default="provenance_report.html",
+                   help="Output HTML file path (default: provenance_report.html)")
+    p.add_argument("--limit", type=int, default=5000, help="Max assets to include.")
+
     args = parser.parse_args()
     {
         "download": cmd_download,
@@ -585,6 +614,7 @@ def main():
         "audit":    cmd_audit,
         "migrate":  cmd_migrate,
         "export":   cmd_export,
+        "report":   cmd_report,
     }[args.command](args)
 
 
