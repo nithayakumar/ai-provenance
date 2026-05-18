@@ -456,13 +456,30 @@ def cmd_enrich(args):
 
 
 def cmd_history(args):
-    from lib.browser_history import list_recent_image_downloads
+    from lib.browser_history import list_recent_image_downloads, _default_history_paths
+    paths = _default_history_paths()
+    if not paths:
+        print("No Chrome/Edge history files found on this machine.")
+        print("\nExpected locations:")
+        print("  ~/Library/Application Support/Google/Chrome/<profile>/History")
+        print("  ~/Library/Application Support/Microsoft Edge/<profile>/History")
+        print("\nFix: grant Full Disk Access to Terminal in")
+        print("  System Settings → Privacy & Security → Full Disk Access")
+        return
+
+    print(f"Found {len(paths)} history file(s):")
+    for p in paths:
+        print(f"  {p}")
+    print()
+
     rows = list_recent_image_downloads(
         history_path=getattr(args, "db", None),
         limit=getattr(args, "limit", 50),
     )
     if not rows:
-        print("No Chrome/Edge history found. Close Chrome and try again."); return
+        print("History files found but no image downloads recorded.")
+        print("Chrome may still be running, or no images have been downloaded recently.")
+        return
     print(f"{'Filename':<40} {'Time (UTC)':<22} {'URL'}")
     print("-" * 100)
     for r in rows:

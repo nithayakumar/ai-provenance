@@ -31,19 +31,33 @@ def _chrome_ts_to_unix(ts: int) -> float:
 
 
 def _default_history_paths() -> list[Path]:
-    home = Path.home()
+    """Return all readable Chrome/Edge history files across every profile."""
+    home  = Path.home()
     local = Path(os.environ.get("LOCALAPPDATA", ""))
-    candidates = [
-        home / "Library/Application Support/Google/Chrome/Default/History",
-        home / "Library/Application Support/Google/Chrome/Profile 1/History",
-        home / "Library/Application Support/Microsoft Edge/Default/History",
-        home / ".config/google-chrome/Default/History",
-        home / ".config/google-chrome/Profile 1/History",
-        home / ".config/microsoft-edge/Default/History",
-        local / "Google/Chrome/User Data/Default/History",
-        local / "Microsoft/Edge/User Data/Default/History",
+
+    # Root dirs that contain profile subdirectories
+    roots = [
+        home / "Library/Application Support/Google/Chrome",
+        home / "Library/Application Support/Google/Chrome Beta",
+        home / "Library/Application Support/Google/Chrome Canary",
+        home / "Library/Application Support/Microsoft Edge",
+        home / ".config/google-chrome",
+        home / ".config/microsoft-edge",
+        local / "Google/Chrome/User Data",
+        local / "Microsoft/Edge/User Data",
     ]
-    return [p for p in candidates if p.exists()]
+
+    paths = []
+    for root in roots:
+        if not root.exists():
+            continue
+        # Each direct child that contains a History file is a profile
+        for child in sorted(root.iterdir()):
+            h = child / "History"
+            if h.exists():
+                paths.append(h)
+
+    return paths
 
 
 @contextlib.contextmanager
