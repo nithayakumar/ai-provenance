@@ -16,9 +16,10 @@ from lib.enrichers.pexels import enrich as _pexels
 from lib.enrichers.wayback import enrich as _wayback
 from lib.enrichers.spawning import enrich as _spawning
 from lib.enrichers.wikimedia import enrich as _wikimedia
+from lib.enrichers.deviantart import enrich as _deviantart
 
 
-_ENRICHERS = [_wikimedia, _unsplash, _pexels, _wayback, _spawning]
+_ENRICHERS = [_wikimedia, _deviantart, _unsplash, _pexels, _wayback, _spawning]
 
 
 def enrich(record: dict, *, wayback: bool = False, spawning: bool = False) -> dict:
