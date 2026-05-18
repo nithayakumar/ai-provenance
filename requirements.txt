@@ -4,16 +4,18 @@ beautifulsoup4>=4.12.0
 watchdog>=3.0.0
 lxml>=4.9.0
 
-# Embedded metadata
-python-xmp-toolkit>=2.0.1  # requires: brew install exempi (macOS) or apt install libexempi-dev
+# Embedded metadata — XMP requires: brew install exempi (macOS)
+python-xmp-toolkit>=2.0.1
 IPTCInfo3>=2.1.4
 
-# C2PA manifest reading
-c2pa-python>=0.5.0
+# C2PA manifest reading — gracefully skipped if not installed
+# Install separately: pip install c2pa-python
+# (prebuilt wheels available for macOS arm64 / x86_64 from PyPI)
 
 # Testing
 pytest>=7.4.0
 pytest-mock>=3.11.0
 
-# Platform API keys (set as env vars — no extra packages needed)
-# UNSPLASH_ACCESS_KEY, PEXELS_API_KEY
+# Platform API keys — no extra packages needed, set as env vars:
+# export UNSPLASH_ACCESS_KEY=...
+# export PEXELS_API_KEY=...

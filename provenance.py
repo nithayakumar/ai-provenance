@@ -113,7 +113,7 @@ def gather_signals(
     }
 
 
-def resolve_canonical(signals: dict) -> dict:
+def resolve_canonical(signals: dict, image_path: str = "") -> dict:
     """Build the canonical provenance record from raw signals."""
     file_meta = signals["file_meta"]
     dims      = signals["dims"]
@@ -215,10 +215,11 @@ def resolve_canonical(signals: dict) -> dict:
         "captured_at":    signals["now"],
         "downloaded_at":  file_meta.get("downloaded_at", signals["now"]),
         "file": {
-            "filename":  file_meta["filename"],
-            "sha256":    file_meta["sha256"],
+            "filename":   file_meta["filename"],
+            "filepath":   str(Path(image_path).resolve()),
+            "sha256":     file_meta["sha256"],
             "size_bytes": file_meta["size_bytes"],
-            "mime_type": file_meta["mime_type"],
+            "mime_type":  file_meta["mime_type"],
         },
         "image":   {k: v for k, v in dims.items() if v is not None},
         "source":  source,
@@ -240,7 +241,7 @@ def collect_provenance(
 ) -> dict:
     """Full pipeline: gather → resolve → score → persist."""
     signals  = gather_signals(image_path, source_url, source_page, http_meta, use_browser_history)
-    prov     = resolve_canonical(signals)
+    prov     = resolve_canonical(signals, image_path)
     prov["completeness"] = compute_completeness(prov)
 
     score = prov["completeness"]["score"]
