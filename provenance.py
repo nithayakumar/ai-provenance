@@ -3,19 +3,22 @@
 AI training image provenance collector.
 
 Commands:
-  download  <url>   Download an image and capture all provenance data.
-  scan      <path>  Process already-downloaded images (file or folder).
-  watch     <dir>   Daemon — auto-capture provenance for new images in a folder.
-  enrich    <path>  Back-fill source URLs from Chrome/Edge browser download history.
-  history           Show recent image downloads found in browser history.
+  download <url>     Download an image and capture full provenance.
+  scan <path>        Process already-downloaded images (file or folder).
+  watch <dir>        Daemon — capture provenance for new images in a folder.
+  enrich <path>      Back-fill missing data from Chrome/Edge history + page scrape.
+  history            Show recent image downloads from Chrome/Edge history.
+  audit [path]       Gap report — files missing key provenance fields.
+  migrate <path>     Upgrade v1.0 .provenance.json sidecars to v2.0.
+  export [csv_path]  Export full collection to CSV.
 
 Examples:
-  python provenance.py download https://example.com/photo.jpg
-  python provenance.py download https://cdn.site.com/img.jpg --source-page https://site.com/post/42
-  python provenance.py scan ~/Downloads/training_images/
-  python provenance.py watch ~/Downloads/lora_drop/
-  python provenance.py enrich ~/Downloads/lora_drop/
-  python provenance.py history
+  python provenance.py download https://civitai.com/images/123456
+  python provenance.py scan ~/Downloads/lora-dataset/ --skip-existing
+  python provenance.py watch ~/Downloads/lora-drop/
+  python provenance.py enrich ~/Downloads/lora-dataset/
+  python provenance.py audit ~/Downloads/lora-dataset/
+  python provenance.py export ~/provenance_export.csv
 """
 
 import argparse
@@ -27,34 +30,202 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
+
 from lib import metadata, scrapers, storage
+from lib.browser_history import find_download_record
+from lib.c2pa_reader import read_c2pa
+from lib.completeness import compute as compute_completeness
+from lib.constants import IMAGE_EXTENSIONS, SCHEMA_VERSION, TOOL_VERSION
+from lib.embedded_metadata import read_all_embedded, extract_ai_training_signals
+from lib.license_spdx import to_spdx
+from lib.opt_out import check_all as check_opt_out
 
 DEFAULT_CSV = "provenance_log.csv"
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif"}
 
 
-def _lookup_browser_history(image_path: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Check Chrome/Edge download history for a source URL matching this file.
-    Returns (download_url, original_source_page).
-    """
-    try:
-        from lib.browser_history import find_download_record
-    except ImportError:
-        return None, None
+# ---------------------------------------------------------------------------
+# Core pipeline — split into focused steps
+# ---------------------------------------------------------------------------
 
+def gather_signals(
+    image_path: str,
+    source_url: Optional[str] = None,
+    source_page: Optional[str] = None,
+    http_meta: Optional[dict] = None,
+    use_browser_history: bool = True,
+) -> dict:
+    """Collect every raw signal for an image. No writes."""
     path = Path(image_path)
-    mtime = path.stat().st_mtime
-    record = find_download_record(path.name, file_mtime=mtime)
-    if not record:
-        return None, None
+    now = datetime.now(timezone.utc).isoformat()
 
-    source_url = record.get("download_url")
-    source_page = record.get("original_source_url") or record.get("tab_url") or record.get("referrer")
-    # Don't return raw Google search pages as the source page — not useful
-    if source_page and "google.com/search" in source_page and "imgurl" not in source_page:
-        source_page = None
-    return source_url, source_page
+    # File basics
+    file_meta = metadata.collect_file_metadata(image_path, captured_at=now)
+    dims = metadata.get_image_dimensions(image_path)
+
+    # Browser history lookup
+    browser_record = None
+    if use_browser_history and not source_url:
+        mtime = path.stat().st_mtime
+        rec = find_download_record(path.name, file_mtime=mtime)
+        if rec:
+            source_url  = rec["download_url"]
+            source_page = source_page or rec.get("original_source_url") or rec.get("tab_url")
+            browser_record = rec
+            # Filter bare Google search pages — not useful as a source page
+            if source_page and "google.com/search" in source_page and "imgurl" not in source_page:
+                source_page = None
+
+    # Embedded metadata (EXIF, XMP, IPTC, C2PA)
+    embedded = read_all_embedded(image_path)
+    c2pa     = read_c2pa(image_path)
+    embedded_signals = extract_ai_training_signals(embedded)
+
+    # Source page scrape
+    page_meta = {}
+    scrape_target = source_page or (
+        source_url
+        if source_url
+        and Path(urllib.parse.urlparse(source_url).path).suffix.lower() not in IMAGE_EXTENSIONS
+        else None
+    )
+    if scrape_target:
+        page_meta = scrapers.scrape_page_metadata(scrape_target)
+
+    # Platform-specific enrichment (CivitAI only in Phase 1)
+    platform_extra = {}
+    if source_url and "civitai" in source_url:
+        platform_extra = scrapers.scrape_civitai(source_url)
+
+    return {
+        "now":              now,
+        "file_meta":        file_meta,
+        "dims":             dims,
+        "source_url":       source_url,
+        "source_page":      source_page,
+        "http_meta":        http_meta or {},
+        "browser_record":   browser_record,
+        "embedded":         embedded,
+        "embedded_signals": embedded_signals,
+        "c2pa":             c2pa,
+        "page_meta":        page_meta,
+        "platform_extra":   platform_extra,
+    }
+
+
+def resolve_canonical(signals: dict) -> dict:
+    """Build the canonical provenance record from raw signals."""
+    file_meta = signals["file_meta"]
+    dims      = signals["dims"]
+    esig      = signals["embedded_signals"]
+    c2pa      = signals["c2pa"]
+    pg        = signals["page_meta"]
+    source_url  = signals["source_url"]
+    source_page = signals["source_page"]
+    http_meta   = signals["http_meta"]
+
+    # --- source ---
+    source: dict = {}
+    if source_url:
+        source["url"]      = source_url
+        source["domain"]   = urllib.parse.urlparse(source_url).netloc
+        source["platform"] = scrapers.detect_platform(source_url)
+    if source_page:
+        source["page_url"] = source_page
+        source.setdefault("platform", scrapers.detect_platform(source_page))
+    if signals["browser_record"]:
+        source["via"] = "browser"
+    elif http_meta.get("url"):
+        source["via"] = "download"
+    else:
+        source["via"] = "scan"
+    if signals["platform_extra"]:
+        source["platform_data"] = signals["platform_extra"]
+    # tdm-reservation from HTTP response headers
+    tdm = http_meta.get("response_headers", {}).get("tdm-reservation")
+
+    # --- creator ---
+    creator: dict = {}
+    author = esig.get("author")
+    if not author:
+        # Fallback: Schema.org author
+        for schema in pg.get("schema_org", []):
+            if not isinstance(schema, dict):
+                continue
+            a = schema.get("author")
+            if a:
+                author = a.get("name") if isinstance(a, dict) else str(a)
+                break
+    if not author:
+        og = pg.get("opengraph", {})
+        author = og.get("article:author") or og.get("og:author")
+    if author:
+        creator["name"] = author
+    if not author and pg.get("author"):
+        creator["name"] = pg["author"]
+
+    # --- rights: license ---
+    license_url  = esig.get("license_url") or pg.get("license_url") or pg.get("cc_license_url")
+    license_text = pg.get("cc_license")
+    if not license_text:
+        for schema in pg.get("schema_org", []):
+            if isinstance(schema, dict) and schema.get("license"):
+                license_url = license_url or str(schema["license"])
+    license_spdx = to_spdx(license_text=license_text, license_url=license_url)
+
+    copyright_ = (
+        esig.get("copyright")
+        or pg.get("copyright")
+        or signals["embedded"].get("exif", {}).get("Copyright")
+    )
+
+    # --- rights: AI training opt-out ---
+    opt_out_result = check_opt_out(
+        url=source_url,
+        iptc_data_mining=signals["embedded"].get("xmp", {}).get("plus_data_mining"),
+        c2pa_training_opt_out=c2pa.get("training_opt_out"),
+    )
+
+    rights: dict = {}
+    if license_spdx:
+        rights["license_spdx"] = license_spdx
+    if license_url:
+        rights["license_url"] = license_url
+    if copyright_:
+        rights["copyright"] = copyright_
+    rights["ai_training"] = opt_out_result
+
+    # --- AI generation status ---
+    is_ai_generated = c2pa.get("ai_generated")
+    ai_source = "c2pa" if c2pa["manifest_present"] else None
+    if is_ai_generated is None and esig.get("is_ai_generated") is not None:
+        is_ai_generated = esig["is_ai_generated"]
+        ai_source = "iptc"
+    ai: dict = {"is_ai_generated": is_ai_generated, "source": ai_source}
+    if c2pa.get("creator_tool"):
+        ai["tool"] = c2pa["creator_tool"]
+    if esig.get("ai_system"):
+        ai.setdefault("tool", esig["ai_system"])
+    if esig.get("ai_prompt"):
+        ai["prompt"] = esig["ai_prompt"]
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool_version":   TOOL_VERSION,
+        "captured_at":    signals["now"],
+        "downloaded_at":  file_meta.get("downloaded_at", signals["now"]),
+        "file": {
+            "filename":  file_meta["filename"],
+            "sha256":    file_meta["sha256"],
+            "size_bytes": file_meta["size_bytes"],
+            "mime_type": file_meta["mime_type"],
+        },
+        "image":   {k: v for k, v in dims.items() if v is not None},
+        "source":  source,
+        "creator": creator,
+        "rights":  rights,
+        "ai":      ai,
+        "c2pa":    {k: v for k, v in c2pa.items() if v not in (None, [], False)},
+    }
 
 
 def collect_provenance(
@@ -64,122 +235,26 @@ def collect_provenance(
     source_page: Optional[str] = None,
     http_meta: Optional[dict] = None,
     use_browser_history: bool = True,
+    dry_run: bool = False,
 ) -> dict:
-    """Gather all provenance for a local image file and write JSON + CSV outputs."""
-    now = datetime.now(timezone.utc).isoformat()
+    """Full pipeline: gather → resolve → score → persist."""
+    signals  = gather_signals(image_path, source_url, source_page, http_meta, use_browser_history)
+    prov     = resolve_canonical(signals)
+    prov["completeness"] = compute_completeness(prov)
 
-    print(f"  Hashing + reading EXIF...")
-    file_meta = metadata.collect_file_metadata(image_path, downloaded_at=now)
-    dims = metadata.get_image_dimensions(image_path)
-    exif = metadata.extract_exif(image_path)
+    score = prov["completeness"]["score"]
+    src   = prov["source"].get("url", "(no url)")[:60]
+    ai_flag = prov["ai"].get("is_ai_generated")
+    opt_flag = prov["rights"]["ai_training"].get("opt_out")
+    print(f"  score={score:.2f}  ai={'yes' if ai_flag else 'no' if ai_flag is False else '?'}  "
+          f"opt_out={'yes' if opt_flag else 'no' if opt_flag is False else '?'}  src={src}")
 
-    # Auto-lookup browser history when no URL was supplied
-    browser_record = None
-    if use_browser_history and not source_url:
-        hist_url, hist_page = _lookup_browser_history(image_path)
-        if hist_url:
-            print(f"  Found in browser history: {hist_url}")
-            source_url = hist_url
-            source_page = source_page or hist_page
-            browser_record = {"matched": True, "download_url": hist_url, "source_page": hist_page}
-        else:
-            print(f"  Not found in browser history (Chrome may be open — close it and retry, or use 'enrich')")
-
-    # Build source block
-    source_meta = dict(http_meta) if http_meta else {}
-    if source_url:
-        source_meta.setdefault("url", source_url)
-        source_meta.setdefault("domain", urllib.parse.urlparse(source_url).netloc)
-    if source_page:
-        source_meta["source_page"] = source_page
-
-    effective_url = source_page or source_url
-    if effective_url:
-        source_meta["platform"] = scrapers.detect_platform(effective_url)
-
-    if browser_record:
-        source_meta["browser_history"] = browser_record
-
-    # Scrape the source page (skip if URL points directly to an image file)
-    page_meta = {}
-    scrape_target = source_page or (
-        source_url
-        if source_url
-        and Path(urllib.parse.urlparse(source_url).path).suffix.lower()
-        not in IMAGE_EXTENSIONS
-        else None
-    )
-    if scrape_target:
-        print(f"  Scraping page metadata from {scrape_target} ...")
-        page_meta = scrapers.scrape_page_metadata(scrape_target)
-
-    # Platform-specific enrichment
-    platform_specific = {}
-    if source_url and "civitai" in source_url:
-        platform_specific = scrapers.scrape_civitai(source_url)
-
-    # Build creator + rights from all signals (EXIF > page meta > schema.org > OG)
-    creator: dict = {}
-    rights: dict = {}
-
-    if exif.get("Artist"):
-        creator["author"] = exif["Artist"]
-    if exif.get("Copyright"):
-        rights["copyright"] = exif["Copyright"]
-
-    if page_meta.get("author"):
-        creator.setdefault("author", page_meta["author"])
-    if page_meta.get("copyright"):
-        rights.setdefault("copyright", page_meta["copyright"])
-    if page_meta.get("license_url"):
-        rights["license_url"] = page_meta["license_url"]
-    if page_meta.get("cc_license"):
-        rights.setdefault("license", page_meta["cc_license"])
-        rights.setdefault("license_url", page_meta.get("cc_license_url", ""))
-
-    og = page_meta.get("opengraph", {})
-    creator.setdefault("platform", og.get("og:site_name", ""))
-    for og_key in ("article:author", "og:author"):
-        if og.get(og_key):
-            creator.setdefault("author", og[og_key])
-            break
-
-    for schema in page_meta.get("schema_org", []):
-        if not isinstance(schema, dict):
-            continue
-        author = schema.get("author")
-        if author:
-            name = author.get("name") if isinstance(author, dict) else str(author)
-            creator.setdefault("author", name)
-        license_val = schema.get("license")
-        if license_val:
-            rights.setdefault("license_url", str(license_val))
-        ch = schema.get("copyrightHolder")
-        if ch:
-            holder = ch.get("name") if isinstance(ch, dict) else str(ch)
-            rights.setdefault("copyright_holder", holder)
-        if schema.get("copyrightYear"):
-            rights.setdefault("copyright_year", str(schema["copyrightYear"]))
-
-    provenance = {
-        "schema_version": "1.0",
-        "file": file_meta,
-        "source": source_meta,
-        "creator": creator,
-        "rights": rights,
-        "image": {**dims, "exif": exif},
-        "page_metadata": page_meta,
-    }
-    if platform_specific:
-        provenance["platform_specific"] = platform_specific
-
-    sidecar_path = storage.write_json_sidecar(image_path, provenance)
-    flat = storage.flatten_for_csv(provenance, sidecar_path)
-    storage.append_csv_record(csv_path, flat)
-
-    print(f"  JSON: {sidecar_path}")
-    print(f"  CSV:  {csv_path}")
-    return provenance
+    if not dry_run:
+        sidecar = storage.persist(image_path, prov)
+        print(f"  -> {sidecar}")
+    else:
+        print("  [dry-run — nothing written]")
+    return prov
 
 
 # ---------------------------------------------------------------------------
@@ -187,181 +262,255 @@ def collect_provenance(
 # ---------------------------------------------------------------------------
 
 def cmd_download(args):
-    url = args.url
+    url     = args.url
     out_dir = Path(args.dir).expanduser() if args.dir else Path.cwd()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    url_path = urllib.parse.urlparse(url).path
-    filename = Path(url_path).name or "image"
+    filename = Path(urllib.parse.urlparse(url).path).name or "image"
     if not Path(filename).suffix:
         filename += ".jpg"
     dest = out_dir / filename
     counter = 1
     while dest.exists():
-        stem, suffix = Path(filename).stem, Path(filename).suffix
-        dest = out_dir / f"{stem}_{counter}{suffix}"
+        stem, suf = Path(filename).stem, Path(filename).suffix
+        dest = out_dir / f"{stem}_{counter}{suf}"
         counter += 1
 
-    print(f"Downloading: {url}")
-    print(f"         -> {dest}")
+    print(f"Downloading: {url}\n      -> {dest}")
     http_meta = scrapers.download_image(url, str(dest))
-    if args.source_page:
-        http_meta["source_page"] = args.source_page
 
     csv_path = args.csv or str(out_dir / DEFAULT_CSV)
     prov = collect_provenance(
-        str(dest),
-        csv_path,
-        source_url=url,
-        source_page=args.source_page,
-        http_meta=http_meta,
-        use_browser_history=False,  # URL already known
+        str(dest), csv_path,
+        source_url=url, source_page=getattr(args, "source_page", None),
+        http_meta=http_meta, use_browser_history=False,
+        dry_run=getattr(args, "dry_run", False),
     )
     print(f"\nDone.  SHA256: {prov['file']['sha256']}")
 
 
 def cmd_scan(args):
-    path = Path(args.path).expanduser()
-    csv_path = args.csv or DEFAULT_CSV
-    no_history = getattr(args, "no_history", False)
+    path        = Path(args.path).expanduser()
+    csv_path    = args.csv or DEFAULT_CSV
+    skip_existing = getattr(args, "skip_existing", False)
+    force       = getattr(args, "force", False)
+    dry_run     = getattr(args, "dry_run", False)
+    no_history  = getattr(args, "no_history", False)
 
     if path.is_file():
-        targets = [path]
+        targets = [path] if metadata.is_image(path) else []
     elif path.is_dir():
-        targets = [
-            p for p in sorted(path.rglob("*"))
-            if p.suffix.lower() in IMAGE_EXTENSIONS
-            and not p.name.endswith(".provenance.json")
-        ]
+        targets = sorted(p for p in path.rglob("*") if metadata.is_image(p))
     else:
-        print(f"Error: {path} does not exist.", file=sys.stderr)
-        sys.exit(1)
+        print(f"Error: {path} not found.", file=sys.stderr); sys.exit(1)
 
-    print(f"Found {len(targets)} image(s) to scan.\n")
+    print(f"Found {len(targets)} image(s).\n")
+    skipped = 0
     for i, img in enumerate(targets, 1):
-        print(f"[{i}/{len(targets)}] {img.name}")
-        # Companion .url file takes priority over browser history lookup
-        url_file = img.with_suffix(".url")
-        source_url = source_page = None
-        if url_file.exists():
-            lines = url_file.read_text(encoding="utf-8").strip().splitlines()
-            source_url = lines[0].strip() if lines else None
-            source_page = lines[1].strip() if len(lines) > 1 else None
-        collect_provenance(
-            str(img), csv_path,
-            source_url=source_url, source_page=source_page,
-            use_browser_history=not no_history and source_url is None,
-        )
-        print()
-
-    print(f"Done. Processed {len(targets)} image(s).")
-
-
-def cmd_enrich(args):
-    """
-    Back-fill source URLs into existing .provenance.json sidecars using
-    Chrome/Edge download history.  Only updates records that have no source URL.
-    """
-    from lib.browser_history import find_download_record
-
-    path = Path(args.path).expanduser()
-    sidecars = (
-        [path] if path.name.endswith(".provenance.json")
-        else list(path.rglob("*.provenance.json"))
-    )
-    if not sidecars:
-        print("No .provenance.json files found.")
-        return
-
-    csv_path = args.csv or DEFAULT_CSV
-    updated = skipped = no_match = 0
-
-    for sidecar in sorted(sidecars):
-        with open(sidecar, encoding="utf-8") as f:
-            prov = json.load(f)
-
-        # Skip if source URL already populated
-        if prov.get("source", {}).get("url"):
+        existing = storage.read_sidecar(str(img))
+        if skip_existing and not force and existing and existing.get("schema_version") == SCHEMA_VERSION:
             skipped += 1
             continue
-
-        filename = prov.get("file", {}).get("filename", "")
-        filepath = prov.get("file", {}).get("filepath", "")
-        mtime = Path(filepath).stat().st_mtime if filepath and Path(filepath).exists() else None
-
-        record = find_download_record(filename, file_mtime=mtime)
-        if not record:
-            print(f"  no history match: {filename}")
-            no_match += 1
-            continue
-
-        source_url = record["download_url"]
-        source_page = (
-            record.get("original_source_url")
-            or record.get("tab_url")
-            or record.get("referrer")
+        print(f"[{i}/{len(targets)}] {img.name}")
+        url_file = img.with_suffix(".url")
+        src_url = src_page = None
+        if url_file.exists():
+            lines = url_file.read_text(encoding="utf-8").strip().splitlines()
+            src_url  = lines[0].strip() if lines else None
+            src_page = lines[1].strip() if len(lines) > 1 else None
+        collect_provenance(
+            str(img), csv_path,
+            source_url=src_url, source_page=src_page,
+            use_browser_history=not no_history and src_url is None,
+            dry_run=dry_run,
         )
-        print(f"  matched: {filename}  ->  {source_url}")
-
-        prov["source"]["url"] = source_url
-        prov["source"]["domain"] = urllib.parse.urlparse(source_url).netloc
-        prov["source"]["platform"] = scrapers.detect_platform(source_url)
-        if source_page:
-            prov["source"].setdefault("source_page", source_page)
-        prov["source"]["browser_history"] = record
-
-        # Scrape the source page for richer metadata if it's not a raw image URL
-        scrape_target = source_page or (
-            source_url
-            if Path(urllib.parse.urlparse(source_url).path).suffix.lower()
-            not in IMAGE_EXTENSIONS
-            else None
-        )
-        if scrape_target and not args.no_scrape:
-            print(f"    scraping {scrape_target} ...")
-            prov["page_metadata"] = scrapers.scrape_page_metadata(scrape_target)
-
-        with open(sidecar, "w", encoding="utf-8") as f:
-            json.dump(prov, f, indent=2, ensure_ascii=False, default=str)
-
-        # Re-append to CSV with enriched data
-        flat = storage.flatten_for_csv(prov, str(sidecar))
-        storage.append_csv_record(csv_path, flat)
-        updated += 1
-
-    print(f"\nEnrich complete: {updated} updated, {skipped} already had URLs, {no_match} no history match.")
-
-
-def cmd_history(args):
-    """Print recent image downloads found in Chrome/Edge history."""
-    from lib.browser_history import list_recent_image_downloads
-    hist_path = getattr(args, "db", None)
-    rows = list_recent_image_downloads(history_path=hist_path, limit=args.limit)
-    if not rows:
-        print("No Chrome/Edge history found (or Chrome is open — close it first).")
-        return
-    print(f"{'Filename':<40} {'Time (UTC)':<26} {'URL'}")
-    print("-" * 100)
-    for r in rows:
-        ts = (r["end_time_utc"] or "")[:19]
-        url = (r["download_url"] or "")[:60]
-        print(f"{r['filename']:<40} {ts:<26} {url}")
+    print(f"\nDone. Processed {len(targets) - skipped}, skipped {skipped}.")
 
 
 def cmd_watch(args):
     from lib.watcher import watch_directory
     watch_dir = str(Path(args.dir).expanduser().resolve())
-    csv_path = args.csv or str(Path(watch_dir) / DEFAULT_CSV)
+    csv_path  = args.csv or str(Path(watch_dir) / DEFAULT_CSV)
     no_history = getattr(args, "no_history", False)
 
     def process(image_path, csv, source_url=None, source_page=None):
-        collect_provenance(
-            image_path, csv,
-            source_url=source_url, source_page=source_page,
-            use_browser_history=not no_history and source_url is None,
-        )
-
+        collect_provenance(image_path, csv, source_url=source_url, source_page=source_page,
+                           use_browser_history=not no_history and source_url is None)
     watch_directory(watch_dir, csv_path, process)
+
+
+def cmd_enrich(args):
+    path    = Path(args.path).expanduser()
+    force   = getattr(args, "force", False)
+    dry_run = getattr(args, "dry_run", False)
+
+    sidecars = [path] if path.name.endswith(".provenance.json") \
+        else sorted(path.rglob("*.provenance.json"))
+    if not sidecars:
+        print("No .provenance.json files found."); return
+
+    updated = skipped = no_match = 0
+    for sidecar in sidecars:
+        try:
+            prov = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        already_has_url = bool(prov.get("source", {}).get("url"))
+        if already_has_url and not force:
+            skipped += 1; continue
+
+        filename = prov.get("file", {}).get("filename", "")
+        filepath = prov.get("file", {}).get("filepath") or str(sidecar.parent / filename)
+        mtime = Path(filepath).stat().st_mtime if filepath and Path(filepath).exists() else None
+
+        rec = find_download_record(filename, file_mtime=mtime)
+        if not rec:
+            print(f"  no match: {filename}"); no_match += 1; continue
+
+        source_url  = rec["download_url"]
+        source_page = rec.get("original_source_url") or rec.get("tab_url") or rec.get("referrer")
+        print(f"  matched: {filename} -> {source_url}")
+
+        prov.setdefault("source", {})
+        prov["source"]["url"]      = source_url
+        prov["source"]["domain"]   = urllib.parse.urlparse(source_url).netloc
+        prov["source"]["platform"] = scrapers.detect_platform(source_url)
+        prov["source"]["via"]      = "browser"
+        if source_page:
+            prov["source"].setdefault("page_url", source_page)
+        prov["source"]["browser_history"] = rec
+
+        if not getattr(args, "no_scrape", False):
+            scrape_target = source_page or (
+                source_url if Path(urllib.parse.urlparse(source_url).path).suffix.lower()
+                not in IMAGE_EXTENSIONS else None
+            )
+            if scrape_target:
+                print(f"    scraping {scrape_target}")
+                pg = scrapers.scrape_page_metadata(scrape_target)
+                # Re-resolve license from scraped page
+                lurl = pg.get("license_url") or pg.get("cc_license_url")
+                ltext = pg.get("cc_license")
+                spdx = to_spdx(license_text=ltext, license_url=lurl)
+                if spdx:
+                    prov.setdefault("rights", {})["license_spdx"] = spdx
+                if lurl:
+                    prov.setdefault("rights", {})["license_url"] = lurl
+
+        prov["completeness"] = compute_completeness(prov)
+        if not dry_run:
+            sidecar.write_text(json.dumps(prov, indent=2, ensure_ascii=False, default=str),
+                               encoding="utf-8")
+            storage.upsert_asset(prov, str(sidecar))
+        updated += 1
+
+    print(f"\nEnrich done: {updated} updated, {skipped} skipped, {no_match} no history match.")
+
+
+def cmd_history(args):
+    from lib.browser_history import list_recent_image_downloads
+    rows = list_recent_image_downloads(
+        history_path=getattr(args, "db", None),
+        limit=getattr(args, "limit", 50),
+    )
+    if not rows:
+        print("No Chrome/Edge history found. Close Chrome and try again."); return
+    print(f"{'Filename':<40} {'Time (UTC)':<22} {'URL'}")
+    print("-" * 100)
+    for r in rows:
+        ts  = (r["end_time_utc"] or "")[:19]
+        url = (r["download_url"] or "")[:58]
+        print(f"{r['filename']:<40} {ts:<22} {url}")
+
+
+def cmd_audit(args):
+    gaps = storage.audit_gaps()
+    print("=== Provenance Audit ===")
+    print(f"  Total assets:         {gaps['total']}")
+    print(f"  Avg completeness:     {gaps['avg_completeness']:.0%}")
+    print(f"  Missing source URL:   {gaps['missing_source_url']}")
+    print(f"  Missing license:      {gaps['missing_license']}")
+    print(f"  AI status unknown:    {gaps['missing_ai_status']}")
+    print(f"  Training opt-out:     {gaps['opted_out']}")
+    if hasattr(args, "path") and args.path:
+        path = Path(args.path).expanduser()
+        rows = storage.query_assets(missing="source_url", limit=20)
+        if rows:
+            print(f"\nFirst {len(rows)} assets missing source URL:")
+            for p in rows:
+                print(f"  {p.get('file', {}).get('filename', '?')}")
+
+
+def cmd_migrate(args):
+    path = Path(args.path).expanduser()
+    sidecars = sorted(path.rglob("*.provenance.json"))
+    if not sidecars:
+        print("No .provenance.json files found."); return
+    migrated = skipped = 0
+    for sidecar in sidecars:
+        try:
+            prov = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if prov.get("schema_version") == SCHEMA_VERSION:
+            skipped += 1; continue
+
+        # Back up original
+        backup = sidecar.with_suffix(".json.v1backup")
+        if not backup.exists():
+            backup.write_bytes(sidecar.read_bytes())
+
+        # Migrate: rename keys
+        new_prov: dict = {
+            "schema_version": SCHEMA_VERSION,
+            "tool_version":   TOOL_VERSION,
+            "captured_at":    prov.get("file", {}).get("downloaded_at", ""),
+            "downloaded_at":  prov.get("file", {}).get("downloaded_at", ""),
+            "file": {
+                "filename":  prov.get("file", {}).get("filename", ""),
+                "sha256":    prov.get("file", {}).get("sha256", ""),
+                "size_bytes": prov.get("file", {}).get("size_bytes", 0),
+                "mime_type": prov.get("file", {}).get("mime_type", ""),
+                "filepath":  prov.get("file", {}).get("filepath"),
+            },
+            "image":  prov.get("image", {}),
+            "source": {
+                "url":      prov.get("source", {}).get("url"),
+                "page_url": prov.get("source", {}).get("source_page"),
+                "platform": prov.get("source", {}).get("platform"),
+                "domain":   prov.get("source", {}).get("domain"),
+                "via":      "scan",
+            },
+            "creator": {"name": prov.get("creator", {}).get("author")},
+            "rights": {
+                "license_spdx": to_spdx(
+                    license_text=prov.get("rights", {}).get("license"),
+                    license_url=prov.get("rights", {}).get("license_url"),
+                ),
+                "license_url":  prov.get("rights", {}).get("license_url"),
+                "copyright":    prov.get("rights", {}).get("copyright"),
+                "ai_training":  {"opt_out": None, "signals": {}},
+            },
+            "ai": {"is_ai_generated": None, "source": None},
+            "c2pa": {"manifest_present": False},
+        }
+        new_prov["completeness"] = compute_completeness(new_prov)
+
+        if not getattr(args, "dry_run", False):
+            sidecar.write_text(json.dumps(new_prov, indent=2, ensure_ascii=False, default=str),
+                               encoding="utf-8")
+            storage.upsert_asset(new_prov, str(sidecar))
+        migrated += 1
+        print(f"  migrated: {sidecar.name}")
+
+    print(f"\nMigrate done: {migrated} migrated, {skipped} already v2.0.")
+
+
+def cmd_export(args):
+    csv_path = getattr(args, "csv_path", None) or DEFAULT_CSV
+    count = storage.export_csv(csv_path)
+    print(f"Exported {count} records -> {csv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -371,55 +520,71 @@ def cmd_watch(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="provenance.py",
-        description="Automate AI training image provenance collection.",
+        description="AI training image provenance collector.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- download ---
-    p_dl = sub.add_parser("download", help="Download an image and capture provenance.")
-    p_dl.add_argument("url", help="Direct URL of the image to download.")
-    p_dl.add_argument("--dir", "-d", metavar="PATH", help="Output directory (default: current dir).")
-    p_dl.add_argument(
-        "--source-page", "-p", metavar="URL",
-        help="URL of the page where the image was found (enables richer metadata scraping).",
-    )
-    p_dl.add_argument("--csv", metavar="PATH", help=f"CSV log path (default: <dir>/{DEFAULT_CSV}).")
+    def add_csv(p): p.add_argument("--csv", metavar="PATH")
+    def add_dry(p): p.add_argument("--dry-run", dest="dry_run", action="store_true")
 
-    # --- scan ---
-    p_sc = sub.add_parser("scan", help="Capture provenance for already-downloaded image(s).")
-    p_sc.add_argument("path", help="Image file or folder to scan.")
-    p_sc.add_argument("--csv", metavar="PATH", help=f"CSV log path (default: ./{DEFAULT_CSV}).")
-    p_sc.add_argument("--no-history", action="store_true", help="Skip browser history lookup.")
+    # download
+    p = sub.add_parser("download", help="Download an image and capture provenance.")
+    p.add_argument("url")
+    p.add_argument("--dir", "-d", metavar="PATH")
+    p.add_argument("--source-page", "-p", dest="source_page", metavar="URL")
+    add_csv(p); add_dry(p)
 
-    # --- watch ---
-    p_wt = sub.add_parser("watch", help="Watch a folder; auto-capture provenance for new images.")
-    p_wt.add_argument("dir", help="Directory to watch.")
-    p_wt.add_argument("--csv", metavar="PATH", help=f"CSV log path (default: <dir>/{DEFAULT_CSV}).")
-    p_wt.add_argument("--no-history", action="store_true", help="Skip browser history lookup.")
+    # scan
+    p = sub.add_parser("scan", help="Capture provenance for existing images.")
+    p.add_argument("path")
+    p.add_argument("--skip-existing", dest="skip_existing", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-history", dest="no_history", action="store_true")
+    add_csv(p); add_dry(p)
 
-    # --- enrich ---
-    p_en = sub.add_parser(
-        "enrich",
-        help="Back-fill source URLs from Chrome/Edge download history into existing provenance records.",
-    )
-    p_en.add_argument("path", help="Folder (or single .provenance.json file) to enrich.")
-    p_en.add_argument("--csv", metavar="PATH", help=f"CSV log path for updated records.")
-    p_en.add_argument("--no-scrape", action="store_true", help="Skip page scraping after URL lookup.")
+    # watch
+    p = sub.add_parser("watch", help="Watch a folder for new images.")
+    p.add_argument("dir")
+    p.add_argument("--no-history", dest="no_history", action="store_true")
+    add_csv(p)
 
-    # --- history ---
-    p_hi = sub.add_parser("history", help="Show recent image downloads from Chrome/Edge history.")
-    p_hi.add_argument("--limit", type=int, default=50, help="Number of records to show (default: 50).")
-    p_hi.add_argument("--db", metavar="PATH", help="Path to Chrome History SQLite file (auto-detected if omitted).")
+    # enrich
+    p = sub.add_parser("enrich", help="Back-fill from Chrome/Edge history.")
+    p.add_argument("path")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-scrape", dest="no_scrape", action="store_true")
+    add_dry(p)
+
+    # history
+    p = sub.add_parser("history", help="Show recent Chrome/Edge image downloads.")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--db", metavar="PATH")
+
+    # audit
+    p = sub.add_parser("audit", help="Gap report.")
+    p.add_argument("path", nargs="?")
+
+    # migrate
+    p = sub.add_parser("migrate", help="Upgrade v1.0 sidecars to v2.0.")
+    p.add_argument("path")
+    add_dry(p)
+
+    # export
+    p = sub.add_parser("export", help="Export full collection to CSV.")
+    p.add_argument("csv_path", nargs="?", default=DEFAULT_CSV)
 
     args = parser.parse_args()
     {
         "download": cmd_download,
-        "scan": cmd_scan,
-        "watch": cmd_watch,
-        "enrich": cmd_enrich,
-        "history": cmd_history,
+        "scan":     cmd_scan,
+        "watch":    cmd_watch,
+        "enrich":   cmd_enrich,
+        "history":  cmd_history,
+        "audit":    cmd_audit,
+        "migrate":  cmd_migrate,
+        "export":   cmd_export,
     }[args.command](args)
 
 

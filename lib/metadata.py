@@ -7,6 +7,8 @@ from typing import Optional
 from PIL import Image
 from PIL.ExifTags import TAGS
 
+from lib.constants import IMAGE_EXTENSIONS
+
 
 def sha256_of_file(filepath: str) -> str:
     h = hashlib.sha256()
@@ -18,35 +20,44 @@ def sha256_of_file(filepath: str) -> str:
 
 def extract_exif(filepath: str) -> dict:
     try:
-        img = Image.open(filepath)
-        raw = img._getexif()
-        if not raw:
-            return {}
-        return {
-            TAGS.get(tag_id, str(tag_id)): str(value)
-            for tag_id, value in raw.items()
-            if tag_id in TAGS
-        }
+        with Image.open(filepath) as img:
+            raw = img.getexif()
+            if not raw:
+                return {}
+            return {
+                TAGS.get(tag_id, str(tag_id)): str(value)
+                for tag_id, value in raw.items()
+                if tag_id in TAGS
+            }
     except Exception:
         return {}
 
 
 def get_image_dimensions(filepath: str) -> dict:
     try:
-        img = Image.open(filepath)
-        return {"width": img.width, "height": img.height, "mode": img.mode}
+        with Image.open(filepath) as img:
+            return {"width": img.width, "height": img.height, "mode": img.mode}
     except Exception:
         return {}
 
 
-def collect_file_metadata(filepath: str, downloaded_at: Optional[str] = None) -> dict:
+def collect_file_metadata(
+    filepath: str,
+    captured_at: Optional[str] = None,
+    downloaded_at: Optional[str] = None,
+) -> dict:
     path = Path(filepath)
     mime, _ = mimetypes.guess_type(str(path))
+    now = datetime.now(timezone.utc).isoformat()
     return {
         "filename": path.name,
-        "filepath": str(path.resolve()),
         "sha256": sha256_of_file(filepath),
         "size_bytes": path.stat().st_size,
         "mime_type": mime or "unknown",
-        "downloaded_at": downloaded_at or datetime.now(timezone.utc).isoformat(),
+        "captured_at": captured_at or now,
+        "downloaded_at": downloaded_at or now,
     }
+
+
+def is_image(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS and not path.name.endswith(".provenance.json")
