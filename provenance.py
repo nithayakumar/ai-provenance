@@ -244,12 +244,17 @@ def collect_provenance(
     prov     = resolve_canonical(signals, image_path)
     prov["completeness"] = compute_completeness(prov)
 
-    score = prov["completeness"]["score"]
-    src   = prov["source"].get("url", "(no url)")[:60]
-    ai_flag = prov["ai"].get("is_ai_generated")
+    score    = prov["completeness"]["score"]
+    src      = prov["source"].get("url", "")
+    ai_flag  = prov["ai"].get("is_ai_generated")
     opt_flag = prov["rights"]["ai_training"].get("opt_out")
-    print(f"  score={score:.2f}  ai={'yes' if ai_flag else 'no' if ai_flag is False else '?'}  "
-          f"opt_out={'yes' if opt_flag else 'no' if opt_flag is False else '?'}  src={src}")
+
+    src_display = src[:60] if src else "—  (run enrich to back-fill)"
+    ai_display  = "yes" if ai_flag else "no" if ai_flag is False else "?"
+    opt_display = "yes" if opt_flag else "no" if opt_flag is False else "?"
+    bar         = "█" * int(score * 10) + "░" * (10 - int(score * 10))
+    print(f"  [{bar}] {score:.0%}  url={'✓' if src else '✗'}  "
+          f"ai={ai_display}  opt_out={opt_display}  {src_display}")
 
     if not dry_run:
         sidecar = storage.persist(image_path, prov)
@@ -291,13 +296,22 @@ def cmd_download(args):
     print(f"\nDone.  SHA256: {prov['file']['sha256']}")
 
 
+def _chrome_is_running() -> bool:
+    import subprocess
+    try:
+        out = subprocess.run(["pgrep", "-x", "Google Chrome"], capture_output=True)
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
 def cmd_scan(args):
-    path        = Path(args.path).expanduser()
-    csv_path    = args.csv or DEFAULT_CSV
+    path          = Path(args.path).expanduser()
+    csv_path      = args.csv or DEFAULT_CSV
     skip_existing = getattr(args, "skip_existing", False)
-    force       = getattr(args, "force", False)
-    dry_run     = getattr(args, "dry_run", False)
-    no_history  = getattr(args, "no_history", False)
+    force         = getattr(args, "force", False)
+    dry_run       = getattr(args, "dry_run", False)
+    no_history    = getattr(args, "no_history", False)
 
     if path.is_file():
         targets = [path] if metadata.is_image(path) else []
@@ -306,8 +320,14 @@ def cmd_scan(args):
     else:
         print(f"Error: {path} not found.", file=sys.stderr); sys.exit(1)
 
-    print(f"Found {len(targets)} image(s).\n")
-    skipped = 0
+    chrome_open = not no_history and _chrome_is_running()
+    if chrome_open:
+        print("⚠  Chrome is running — browser history is locked.")
+        print("   Source URLs will be missing. Close Chrome and run:")
+        print(f"   python provenance.py enrich {path}\n")
+
+    print(f"Scanning {len(targets)} image(s)...\n")
+    skipped = no_url = 0
     for i, img in enumerate(targets, 1):
         existing = storage.read_sidecar(str(img))
         if skip_existing and not force and existing and existing.get("schema_version") == SCHEMA_VERSION:
@@ -320,13 +340,27 @@ def cmd_scan(args):
             lines = url_file.read_text(encoding="utf-8").strip().splitlines()
             src_url  = lines[0].strip() if lines else None
             src_page = lines[1].strip() if len(lines) > 1 else None
-        collect_provenance(
+        prov = collect_provenance(
             str(img), csv_path,
             source_url=src_url, source_page=src_page,
             use_browser_history=not no_history and src_url is None,
             dry_run=dry_run,
         )
-    print(f"\nDone. Processed {len(targets) - skipped}, skipped {skipped}.")
+        if not prov.get("source", {}).get("url"):
+            no_url += 1
+
+    processed = len(targets) - skipped
+    print(f"\n{'─'*50}")
+    print(f"  Scanned:          {processed}")
+    print(f"  Skipped:          {skipped}")
+    print(f"  Missing source URL: {no_url}/{processed}")
+    if no_url and not dry_run:
+        action = f"python provenance.py enrich {path}"
+        if chrome_open:
+            print(f"\n  → Close Chrome, then run:  {action}")
+        else:
+            print(f"\n  → Run to back-fill URLs:   {action}")
+    print(f"  → View results:    python provenance.py report")
 
 
 def cmd_watch(args):
@@ -345,6 +379,10 @@ def cmd_enrich(args):
     path    = Path(args.path).expanduser()
     force   = getattr(args, "force", False)
     dry_run = getattr(args, "dry_run", False)
+
+    if _chrome_is_running():
+        print("⚠  Chrome is running — history file is locked. Close Chrome and try again.")
+        sys.exit(1)
 
     sidecars = [path] if path.name.endswith(".provenance.json") \
         else sorted(path.rglob("*.provenance.json"))
